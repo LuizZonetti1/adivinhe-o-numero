@@ -73,16 +73,17 @@ static void prompt_and_send_number(SOCKET sock, const char* pergunta, int minv, 
         char* end = NULL;
         long val = strtol(linha, &end, 10);
         if (end == linha || *end != '\0') {
-            printf("Entrada invalida. Digite um numero.\n");
+            printf("[!] Entrada invalida. Digite um numero.\n");
             continue;
         }
         if (val < minv || val > maxv) {
-            printf("Fora do intervalo.\n");
+            printf("[X] Fora do intervalo (%d-%d). Tente novamente.\n", minv, maxv);
             continue;
         }
         char msg[64];
         snprintf(msg, sizeof(msg), "%ld", val);
         envia_ln(sock, msg);
+        printf("[OK] Numero enviado: %ld\n", val);
         return;
     }
 }
@@ -97,9 +98,17 @@ static void prompt_and_send_choice(SOCKET sock, const char* pergunta) {
             return;
         }
         trim_crlf(linha);
-        if (linha[0] == '1') { envia_ln(sock, "1"); return; }
-        if (linha[0] == '2') { envia_ln(sock, "2"); return; }
-        printf("Digite 1 para Sim ou 2 para Nao.\n");
+        if (linha[0] == '1') { 
+            envia_ln(sock, "1"); 
+            printf("[OK] Opcao escolhida: Sim\n");
+            return; 
+        }
+        if (linha[0] == '2') { 
+            envia_ln(sock, "2"); 
+            printf("[OK] Opcao escolhida: Nao\n");
+            return; 
+        }
+        printf("[!] Digite 1 para Sim ou 2 para Nao.\n");
     }
 }
 
@@ -126,14 +135,18 @@ int main(void) {
     serv.sin_port = htons(SERVER_PORT);
     serv.sin_addr.s_addr = inet_addr(SERVER_IP);
 
-    printf("Conectando ao servidor %s:%d...\n", SERVER_IP, SERVER_PORT);
+    printf("\n+----------------------------------------------------------+\n");
+    printf("|                  >> JOGO DE ADIVINHACAO <<              |\n");
+    printf("+----------------------------------------------------------+\n");
+    printf("| Conectando ao servidor %s:%d...                    |\n", SERVER_IP, SERVER_PORT);
+    printf("+----------------------------------------------------------+\n\n");
     if (connect(sock, (struct sockaddr*)&serv, sizeof(serv)) == SOCKET_ERROR) {
-        printf("Nao foi possivel conectar.\n");
+        printf("[X] ERRO: Nao foi possivel conectar ao servidor.\n");
         closesocket(sock);
         WSACleanup();
         return 1;
     }
-    printf("Conectado. Aguarde instrucoes...\n");
+    printf("[OK] Conectado com sucesso! Aguardando instrucoes...\n\n");
 
     char linha[512];
     int jogando = 1;
@@ -146,49 +159,77 @@ int main(void) {
 
         // Decodifica comandos
         if (strncmp(linha, "BEM_VINDO", 9) == 0) {
-            printf("[SERVIDOR] %s\n", linha);
+            printf("\n>> %s! Bem-vindo ao jogo! <<\n", linha);
+            printf("==========================================================\n");
         } else if (strncmp(linha, "DEFINA_SECRETO", 14) == 0) {
             // formato: DEFINA_SECRETO min max
             int minv = 1, maxv = 100;
             sscanf(linha, "DEFINA_SECRETO %d %d", &minv, &maxv);
-            prompt_and_send_number(sock, "Defina seu numero secreto", minv, maxv);
+            printf("\n+-------------------------------------------------------+\n");
+            printf("|              >> FASE DE CONFIGURACAO <<              |\n");
+            printf("+-------------------------------------------------------+\n");
+            prompt_and_send_number(sock, "[?] Defina seu numero secreto", minv, maxv);
+            printf("\n[...] Aguarde o adversario definir o numero dele...\n");
+            printf("=======================================================\n");
+        } else if (strcmp(linha, "AGUARDE_ADVERSARIO_ESCOLHER") == 0) {
+            printf("\n[...] Aguarde: o adversario esta escolhendo o numero secreto...\n");
         } else if (strcmp(linha, "SUA_VEZ") == 0) {
-            prompt_and_send_number(sock, "Seu palpite", 1, 100);
+            printf("\n+-------------------------------------------------------+\n");
+            printf("|                  >> SUA VEZ DE JOGAR <<              |\n");
+            printf("+-------------------------------------------------------+\n");
+            prompt_and_send_number(sock, "[>] Qual e o seu palpite?", 1, 100);
         } else if (strcmp(linha, "VEZ_DO_OPONENTE") == 0) {
-            printf("Aguarde: vez do oponente...\n");
+            printf("\n[...] Aguarde: e a vez do seu adversario jogar...\n");
         } else if (strncmp(linha, "RESULTADO ", 10) == 0) {
             const char* res = linha + 10;
-            if (strcmp(res, "MAIOR") == 0) printf("Resposta: o numero e maior.\n");
-            else if (strcmp(res, "MENOR") == 0) printf("Resposta: o numero e menor.\n");
-            else if (strcmp(res, "ACERTOU") == 0) printf("Voce ACERTOU!\n");
-            else if (strcmp(res, "ENTRADA_INVALIDA") == 0) printf("Entrada invalida. Tente novamente.\n");
+            if (strcmp(res, "MAIOR") == 0) printf("[^] RESULTADO: O numero e MAIOR que seu palpite!\n");
+            else if (strcmp(res, "MENOR") == 0) printf("[v] RESULTADO: O numero e MENOR que seu palpite!\n");
+            else if (strcmp(res, "ACERTOU") == 0) printf("[*] PARABENS! Voce ACERTOU o numero! [*]\n");
+            else if (strcmp(res, "ENTRADA_INVALIDA") == 0) printf("[!] Entrada invalida. Tente novamente.\n");
             else printf("RESULTADO: %s\n", res);
         } else if (strncmp(linha, "OPONENTE_CHUTOU ", 16) == 0) {
             int palpite = 0;
             char tag[32] = {0};
             sscanf(linha, "OPONENTE_CHUTOU %d %31s", &palpite, tag);
-            printf("Oponente chutou %d (%s)\n", palpite, tag);
+            printf("\n[~] ADVERSARIO: Chutou %d", palpite);
+            if (strcmp(tag, "MAIOR") == 0) printf(" - Seu numero e MAIOR! [^]\n");
+            else if (strcmp(tag, "MENOR") == 0) printf(" - Seu numero e MENOR! [v]\n");
+            else if (strcmp(tag, "ACERTOU") == 0) printf(" - ACERTOU seu numero! [*]\n");
+            else printf(" (%s)\n", tag);
         } else if (strcmp(linha, "OPONENTE_ACERTOU") == 0) {
-            printf("Oponente acertou o seu numero.\n");
+            printf("[X] O adversario acertou o seu numero secreto!\n");
         } else if (strncmp(linha, "FIM_PARTIDA ", 12) == 0) {
             const char* res = linha + 12;
-            if (strcmp(res, "VENCEU") == 0) printf("==> Fim da partida: VOCE VENCEU!\n");
-            else if (strcmp(res, "PERDEU") == 0) printf("==> Fim da partida: voce perdeu.\n");
-            else printf("==> Fim da partida: %s\n", res);
+            printf("\n+==========================================================+\n");
+            if (strcmp(res, "VENCEU") == 0) {
+                printf("|               [*] PARABENS! VOCE VENCEU! [*]            |\n");
+                printf("|                  Voce foi mais rapido!                  |\n");
+            } else if (strcmp(res, "PERDEU") == 0) {
+                printf("|                [X] VOCE PERDEU DESTA VEZ [X]            |\n");
+                printf("|              O adversario foi mais rapido!             |\n");
+            } else {
+                printf("|                    FIM DA PARTIDA: %s                    |\n", res);
+            }
+            printf("+=========================================================+\n");
         } else if (strncmp(linha, "JOGAR_NOVAMENTE?", 16) == 0) {
-            prompt_and_send_choice(sock, "Jogar novamente? 1-Sim 2-Nao:");
+            printf("\n[?] Deseja jogar uma nova partida?\n");
+            printf("====================================\n");
+            prompt_and_send_choice(sock, "[>] Sua escolha - 1-Sim 2-Nao:");
         } else if (strcmp(linha, "ENCERRAR") == 0) {
-            printf("Encerrando conforme solicitado pelo servidor.\n");
+            printf("\n[!] Obrigado por jogar! Ate a proxima!\n");
             jogando = 0;
         } else if (strcmp(linha, "ENTRADA_INVALIDA") == 0) {
-            printf("Entrada invalida. Tente novamente.\n");
+            printf("[!] Entrada invalida. Tente novamente.\n");
         } else {
             // Mensagem desconhecida (log)
             printf("[SERVIDOR] %s\n", linha);
         }
     }
 
-    printf("Pressione Enter para sair...");
+    printf("\n+============================================================+\n");
+    printf("|                  [!] OBRIGADO POR JOGAR! [!]             |\n");
+    printf("|                  Pressione Enter para sair...           |\n");
+    printf("+============================================================+\n");
     fflush(stdout);
     getchar();
 

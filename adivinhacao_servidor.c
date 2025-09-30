@@ -118,6 +118,16 @@ int main(void) {
         // Cada jogador define seu numero secreto
         int secreto[2] = {0, 0};
         for (int i = 0; i < 2; i++) {
+            // Informa o outro jogador que deve aguardar
+            int outro = 1 - i;
+            if (i == 0) {
+                // P2 aguarda P1 escolher
+                envia_ln(clientes[outro], "AGUARDE_ADVERSARIO_ESCOLHER");
+            } else {
+                // P1 aguarda P2 escolher  
+                envia_ln(clientes[outro], "AGUARDE_ADVERSARIO_ESCOLHER");
+            }
+            
             for (;;) {
                 envia_ln(clientes[i], "DEFINA_SECRETO 1 100");
                 int r = recebe_ln(clientes[i], buffer, sizeof(buffer));
