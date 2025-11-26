@@ -1,4 +1,6 @@
+// -----------------------------------------------------------------------------
 // Cliente do jogo de adivinhação (modo simultâneo)
+// -----------------------------------------------------------------------------
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,7 +99,11 @@ static void set_secret_bounds(int minv, int maxv) {
     InterlockedExchange(&g_input.secret_max, (LONG)maxv);
 }
 
-static int prompt_and_send_value(const char* pergunta, int minv, int maxv, const char* prefixo) {
+static int prompt_and_send_value(const char* pergunta,
+                                 int minv,
+                                 int maxv,
+                                 InputMode modo_necessario,
+                                 const char* prefixo) {
     char linha[128];
     while (is_running()) {
         printf("%s (%d-%d) [digite 'sair' para abandonar]: ", pergunta, minv, maxv);
@@ -121,8 +127,7 @@ static int prompt_and_send_value(const char* pergunta, int minv, int maxv, const
             printf("[X] Valor fora do intervalo permitido.\n");
             continue;
         }
-        InputMode esperado = prefixo ? INPUT_GUESS : INPUT_SECRET;
-        if (get_mode() != esperado) {
+        if (get_mode() != modo_necessario) {
             printf("[!] Estado alterado. Aguarde novas instrucoes.\n");
             return 0;
         }
@@ -144,19 +149,141 @@ static unsigned __stdcall input_thread(void* param) {
         if (modo == INPUT_SECRET) {
             int minv = (int)InterlockedCompareExchange(&g_input.secret_min, 0, 0);
             int maxv = (int)InterlockedCompareExchange(&g_input.secret_max, 0, 0);
-            if (prompt_and_send_value("[?] Escolha seu numero secreto", minv, maxv, NULL)) {
+            if (prompt_and_send_value("[?] Escolha seu numero secreto",
+                                      minv,
+                                      maxv,
+                                      INPUT_SECRET,
+                                      NULL)) {
                 set_mode(INPUT_IDLE);
                 printf("\n[...] Numero enviado, aguardando adversario...\n");
             }
             continue;
         }
         if (modo == INPUT_GUESS) {
-            prompt_and_send_value("[>] Seu palpite", VALOR_MIN, VALOR_MAX, "PALPITE");
+            prompt_and_send_value("[>] Seu palpite",
+                                  VALOR_MIN,
+                                  VALOR_MAX,
+                                  INPUT_GUESS,
+                                  "PALPITE");
             continue;
         }
         Sleep(80);
     }
     return 0;
+}
+
+static void processar_comando_servidor(const char* linha) {
+    if (strncmp(linha, "BEM_VINDO", 9) == 0) {
+        printf("\n>> %s! Bem-vindo ao jogo simultaneo! <<\n", linha);
+        printf("==========================================================\n");
+        return;
+    }
+
+    if (strncmp(linha, "DEFINA_SECRETO", 14) == 0) {
+        int minv = VALOR_MIN, maxv = VALOR_MAX;
+        sscanf(linha, "DEFINA_SECRETO %d %d", &minv, &maxv);
+        set_secret_bounds(minv, maxv);
+        set_mode(INPUT_SECRET);
+        printf("[!] Defina o seu numero secreto no intervalo %d-%d.\n", minv, maxv);
+        return;
+    }
+
+    if (strcmp(linha, "SECRETO_REGISTRADO") == 0) {
+        printf("[+] Numero secreto registrado no servidor.\n");
+        return;
+    }
+
+    if (strcmp(linha, "AGUARDE_OPONENTE_DEFINIR") == 0 ||
+        strcmp(linha, "AGUARDE_ADVERSARIO_ESCOLHER") == 0) {
+        set_mode(INPUT_IDLE);
+        printf("[...] Aguardando o adversario definir o numero.\n");
+        return;
+    }
+
+    if (strncmp(linha, "LIBERADO_PALPITES", 17) == 0) {
+        set_mode(INPUT_GUESS);
+        printf("\n[*] Ambos podem palpitar livremente! Digite seus palpites quando quiser (ou 'sair' para abandonar).\n");
+        return;
+    }
+
+    if (strcmp(linha, "VOCES_PODEM_ADIVINHAR_A_QUALQUER_MOMENTO") == 0) {
+        printf("[>] Palpites liberados em paralelo. Boa sorte!\n");
+        return;
+    }
+
+    if (strncmp(linha, "PALPITE_RESULTADO ", 18) == 0 || strncmp(linha, "RESULTADO ", 10) == 0) {
+        const char* res = (linha[0] == 'P') ? linha + 18 : linha + 10;
+        if (strcmp(res, "MAIOR") == 0) printf("[^] O numero escondido e MAIOR que seu palpite.\n");
+        else if (strcmp(res, "MENOR") == 0) printf("[v] O numero escondido e MENOR que seu palpite.\n");
+        else if (strcmp(res, "ACERTOU") == 0) printf("[*] Voce acertou! Aguarde a confirmacao final.\n");
+        else if (strcmp(res, "AGUARDE") == 0) printf("[...] Aguarde: o adversario ainda nao definiu o numero.\n");
+        else if (strcmp(res, "PARTIDA_ENCERRADA") == 0) printf("[!] Partida ja encerrada. Aguarde novos comandos.\n");
+        else if (strcmp(res, "ENTRADA_INVALIDA") == 0) printf("[!] Entrada invalida. Tente novamente.\n");
+        else printf("RESULTADO: %s\n", res);
+        return;
+    }
+
+    if (strncmp(linha, "OPONENTE_TENTOU ", 16) == 0 || strncmp(linha, "OPONENTE_CHUTOU ", 16) == 0) {
+        int palpite = 0;
+        char tag[64] = {0};
+        sscanf(linha, "OPONENTE_%*[^ ] %d %63s", &palpite, tag);
+        printf("[~] Oponente chutou %d (%s).\n", palpite, tag);
+        return;
+    }
+
+    if (strncmp(linha, "NUMERO_ATUALIZADO ", 19) == 0) {
+        int novo = 0;
+        char oper[64] = {0};
+        sscanf(linha, "NUMERO_ATUALIZADO %d %63s", &novo, oper);
+        printf("[!] O servidor alterou seu numero para %d (%s). Compartilhe esse valor com cuidado!\n", novo, oper);
+        return;
+    }
+
+    if (strncmp(linha, "NUMERO_DO_OPONENTE_MUDOU ", 25) == 0) {
+        const char* desc = linha + 25;
+        printf("[!] O numero do oponente foi alterado (%s). Reavalie seus palpites!\n", desc);
+        return;
+    }
+
+    if (strcmp(linha, "OPONENTE_DESCONECTOU") == 0) {
+        set_mode(INPUT_IDLE);
+        printf("[X] O oponente desconectou. Partida encerrada.\n");
+        return;
+    }
+
+    if (strcmp(linha, "OPONENTE_ACERTOU") == 0) {
+        set_mode(INPUT_IDLE);
+        printf("[X] O adversario acertou o seu numero!\n");
+        return;
+    }
+
+    if (strncmp(linha, "FIM_PARTIDA ", 12) == 0) {
+        set_mode(INPUT_IDLE);
+        const char* res = linha + 12;
+        printf("\n+==========================================================+\n");
+        if (strcmp(res, "VENCEU") == 0) {
+            printf("|            [*] PARABENS! VOCE VENCEU! [*]              |\n");
+        } else if (strcmp(res, "PERDEU") == 0) {
+            printf("|            [X] O ADVERSARIO VENCEU AGORA. [X]          |\n");
+        } else {
+            printf("|                RESULTADO FINAL: %s                |\n", res);
+        }
+        printf("+==========================================================+\n");
+        return;
+    }
+
+    if (strcmp(linha, "ENCERRAR") == 0) {
+        printf("\n[!] Servidor solicitou encerramento.\n");
+        stop_running();
+        return;
+    }
+
+    if (strcmp(linha, "ENTRADA_INVALIDA") == 0) {
+        printf("[!] Entrada invalida.\n");
+        return;
+    }
+
+    printf("[SERVIDOR] %s\n", linha);
 }
 
 int main(void) {
@@ -208,73 +335,10 @@ int main(void) {
             break;
         }
 
-        if (strncmp(linha, "BEM_VINDO", 9) == 0) {
-            printf("\n>> %s! Bem-vindo ao jogo simultaneo! <<\n", linha);
-            printf("==========================================================\n");
-        } else if (strncmp(linha, "DEFINA_SECRETO", 14) == 0) {
-            int minv = VALOR_MIN, maxv = VALOR_MAX;
-            sscanf(linha, "DEFINA_SECRETO %d %d", &minv, &maxv);
-            set_secret_bounds(minv, maxv);
-            set_mode(INPUT_SECRET);
-            printf("[!] Defina o seu numero secreto no intervalo %d-%d.\n", minv, maxv);
-        } else if (strcmp(linha, "SECRETO_REGISTRADO") == 0) {
-            printf("[+] Numero secreto registrado no servidor.\n");
-        } else if (strcmp(linha, "AGUARDE_OPONENTE_DEFINIR") == 0 || strcmp(linha, "AGUARDE_ADVERSARIO_ESCOLHER") == 0) {
-            set_mode(INPUT_IDLE);
-            printf("[...] Aguardando o adversario definir o numero.\n");
-        } else if (strncmp(linha, "LIBERADO_PALPITES", 17) == 0) {
-            set_mode(INPUT_GUESS);
-            printf("\n[*] Ambos podem palpitar livremente! Digite seus palpites quando quiser (ou 'sair' para abandonar).\n");
-        } else if (strcmp(linha, "VOCES_PODEM_ADIVINHAR_A_QUALQUER_MOMENTO") == 0) {
-            printf("[>] Palpites liberados em paralelo. Boa sorte!\n");
-        } else if (strncmp(linha, "PALPITE_RESULTADO ", 18) == 0 || strncmp(linha, "RESULTADO ", 10) == 0) {
-            const char* res = (linha[0] == 'P') ? linha + 18 : linha + 10;
-            if (strcmp(res, "MAIOR") == 0) printf("[^] O numero escondido e MAIOR que seu palpite.\n");
-            else if (strcmp(res, "MENOR") == 0) printf("[v] O numero escondido e MENOR que seu palpite.\n");
-            else if (strcmp(res, "ACERTOU") == 0) printf("[*] Voce acertou! Aguarde a confirmacao final.\n");
-            else if (strcmp(res, "AGUARDE") == 0) printf("[...] Aguarde: o adversario ainda nao definiu o numero.\n");
-            else if (strcmp(res, "PARTIDA_ENCERRADA") == 0) printf("[!] Partida ja encerrada. Aguarde novos comandos.\n");
-            else if (strcmp(res, "ENTRADA_INVALIDA") == 0) printf("[!] Entrada invalida. Tente novamente.\n");
-            else printf("RESULTADO: %s\n", res);
-        } else if (strncmp(linha, "OPONENTE_TENTOU ", 16) == 0 || strncmp(linha, "OPONENTE_CHUTOU ", 16) == 0) {
-            int palpite = 0;
-            char tag[64] = {0};
-            sscanf(linha, "OPONENTE_%*[^ ] %d %63s", &palpite, tag);
-            printf("[~] Oponente chutou %d (%s).\n", palpite, tag);
-        } else if (strncmp(linha, "NUMERO_ATUALIZADO ", 19) == 0) {
-            int novo = 0;
-            char oper[64] = {0};
-            sscanf(linha, "NUMERO_ATUALIZADO %d %63s", &novo, oper);
-            printf("[!] O servidor alterou seu numero para %d (%s). Compartilhe esse valor com cuidado!\n", novo, oper);
-        } else if (strncmp(linha, "NUMERO_DO_OPONENTE_MUDOU ", 25) == 0) {
-            const char* desc = linha + 25;
-            printf("[!] O numero do oponente foi alterado (%s). Reavalie seus palpites!\n", desc);
-        } else if (strcmp(linha, "OPONENTE_DESCONECTOU") == 0) {
-            set_mode(INPUT_IDLE);
-            printf("[X] O oponente desconectou. Partida encerrada.\n");
-        } else if (strcmp(linha, "OPONENTE_ACERTOU") == 0) {
-            set_mode(INPUT_IDLE);
-            printf("[X] O adversario acertou o seu numero!\n");
-        } else if (strncmp(linha, "FIM_PARTIDA ", 12) == 0) {
-            set_mode(INPUT_IDLE);
-            const char* res = linha + 12;
-            printf("\n+==========================================================+\n");
-            if (strcmp(res, "VENCEU") == 0) {
-                printf("|            [*] PARABENS! VOCE VENCEU! [*]              |\n");
-            } else if (strcmp(res, "PERDEU") == 0) {
-                printf("|            [X] O ADVERSARIO VENCEU AGORA. [X]          |\n");
-            } else {
-                printf("|                RESULTADO FINAL: %s                |\n", res);
-            }
-            printf("+==========================================================+\n");
-        } else if (strcmp(linha, "ENCERRAR") == 0) {
-            printf("\n[!] Servidor solicitou encerramento.\n");
-            stop_running();
+        processar_comando_servidor(linha);
+
+        if (_stricmp(linha, "ENCERRAR") == 0) {
             break;
-        } else if (strcmp(linha, "ENTRADA_INVALIDA") == 0) {
-            printf("[!] Entrada invalida.\n");
-        } else {
-            printf("[SERVIDOR] %s\n", linha);
         }
     }
 

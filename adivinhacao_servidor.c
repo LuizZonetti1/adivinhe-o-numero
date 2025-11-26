@@ -1,4 +1,6 @@
+// -----------------------------------------------------------------------------
 // Servidor do jogo de adivinhação (modo simultâneo com memória compartilhada)
+// -----------------------------------------------------------------------------
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +16,21 @@
 #define MIN_SECRETO         1
 #define MAX_SECRETO         100
 #define ERROS_PARA_MUTACAO  3
+
+typedef enum {
+    MUT_MULTIPLICADO_POR_2 = 0,
+    MUT_SOMADO_7,
+    MUT_DIVIDIDO_POR_2,
+    MUT_SUBTRAIDO_5,
+    MUT_TOTAL
+} MutationType;
+
+static const char* kMutationLabels[MUT_TOTAL] = {
+    "MULTIPLICADO_POR_2",
+    "SOMADO_7",
+    "DIVIDIDO_POR_2",
+    "SUBTRAIDO_5"
+};
 
 typedef struct {
     SOCKET sock;
@@ -103,6 +120,27 @@ static int clamp_int(int v, int lo, int hi) {
     return v;
 }
 
+static int aplicar_operacao_mutacao(int valor, MutationType operacao) {
+    switch (operacao) {
+        case MUT_MULTIPLICADO_POR_2: return valor * 2;
+        case MUT_SOMADO_7:          return valor + 7;
+        case MUT_DIVIDIDO_POR_2:    return valor / 2;
+        case MUT_SUBTRAIDO_5:       return valor - 5;
+        default:                    return valor;
+    }
+}
+
+static int mutacao_dentro_do_intervalo(int valor_atual,
+                                       MutationType operacao,
+                                       int* valor_resultante) {
+    int candidato = aplicar_operacao_mutacao(valor_atual, operacao);
+    if (candidato < MIN_SECRETO || candidato > MAX_SECRETO) {
+        return 0;
+    }
+    if (valor_resultante) *valor_resultante = candidato;
+    return 1;
+}
+
 static int registrar_secreto(GameState* jogo, int jogador, int valor) {
     int iniciar = 0;
     EnterCriticalSection(&jogo->lock);
@@ -126,25 +164,37 @@ static void avisar_inicio(GameState* jogo) {
     }
 }
 
-static void aplicar_mutacao(GameState* jogo, int jogador, char* dono_msg, size_t dono_sz, char* opo_msg, size_t opo_sz) {
-    static const char* descricoes[] = {
-        "MULTIPLICADO_POR_2",
-        "SOMADO_7",
-        "DIVIDIDO_POR_2",
-        "SUBTRAIDO_5"
-    };
-    int operacao = rand() % 4;
-    int valor = jogo->jogadores[jogador].secret;
-    switch (operacao) {
-        case 0: valor *= 2; break;
-        case 1: valor += 7; break;
-        case 2: valor = valor / 2; break;
-        case 3: valor -= 5; break;
+static int aplicar_mutacao(GameState* jogo,
+                           int alvo,
+                           char* msg_para_alvo,
+                           size_t tam_msg_alvo,
+                           char* msg_para_palpiteiro,
+                           size_t tam_msg_palpiteiro) {
+    int valor_atual = jogo->jogadores[alvo].secret;
+    MutationType opcoes_validas[MUT_TOTAL];
+    int total_validas = 0;
+
+    for (int op = 0; op < MUT_TOTAL; ++op) {
+        if (mutacao_dentro_do_intervalo(valor_atual,
+                                        (MutationType)op,
+                                        NULL)) {
+            opcoes_validas[total_validas++] = (MutationType)op;
+        }
     }
-    valor = clamp_int(valor, MIN_SECRETO, MAX_SECRETO);
-    jogo->jogadores[jogador].secret = valor;
-    snprintf(dono_msg, dono_sz, "NUMERO_ATUALIZADO %d %s", valor, descricoes[operacao]);
-    snprintf(opo_msg, opo_sz, "NUMERO_DO_OPONENTE_MUDOU %s", descricoes[operacao]);
+
+    if (total_validas == 0) {
+        return 0; // Nenhuma mutação manteria o valor dentro do intervalo.
+    }
+
+    MutationType operacao = opcoes_validas[rand() % total_validas];
+    int novo_valor = aplicar_operacao_mutacao(valor_atual, operacao);
+    jogo->jogadores[alvo].secret = novo_valor;
+
+    snprintf(msg_para_alvo, tam_msg_alvo,
+             "NUMERO_ATUALIZADO %d %s", novo_valor, kMutationLabels[operacao]);
+    snprintf(msg_para_palpiteiro, tam_msg_palpiteiro,
+             "NUMERO_DO_OPONENTE_MUDOU %s", kMutationLabels[operacao]);
+    return 1;
 }
 
 static int finalizar_partida(GameState* jogo, int vencedor) {
@@ -190,11 +240,11 @@ static void tratar_desconexao(GameState* jogo, int jogador) {
 }
 
 static void tratar_palpite(GameState* jogo, int jogador, int palpite) {
-    int alvo = 1 - jogador;
+    const int alvo = 1 - jogador;
     char resultado[16] = {0};
-    char mut_dono[128] = {0};
-    char mut_opo[128] = {0};
-    int aplicar_mut = 0;
+    char msg_para_alvo[128] = {0};
+    char msg_para_palpiteiro[128] = {0};
+    int houve_mutacao = 0;
     int secreto_do_oponente = 0;
     int partida_ativa = 0;
     int oponente_pronto = 0;
@@ -225,8 +275,12 @@ static void tratar_palpite(GameState* jogo, int jogador, int palpite) {
     if (!encerrar_com_vitoria) {
         jogo->jogadores[jogador].erros_consecutivos++;
         if (jogo->jogadores[jogador].erros_consecutivos % ERROS_PARA_MUTACAO == 0) {
-            aplicar_mut = 1;
-            aplicar_mutacao(jogo, alvo, mut_dono, sizeof(mut_dono), mut_opo, sizeof(mut_opo));
+            houve_mutacao = aplicar_mutacao(jogo,
+                                            alvo,
+                                            msg_para_alvo,
+                                            sizeof(msg_para_alvo),
+                                            msg_para_palpiteiro,
+                                            sizeof(msg_para_palpiteiro));
         }
     }
     LeaveCriticalSection(&jogo->lock);
@@ -234,9 +288,9 @@ static void tratar_palpite(GameState* jogo, int jogador, int palpite) {
     envia_fmt(jogo->jogadores[jogador].sock, "PALPITE_RESULTADO %s", resultado);
     envia_fmt(jogo->jogadores[alvo].sock, "OPONENTE_TENTOU %d %s", palpite, resultado);
 
-    if (aplicar_mut) {
-        envia_ln(jogo->jogadores[alvo].sock, mut_dono);
-        envia_ln(jogo->jogadores[jogador].sock, mut_opo);
+    if (houve_mutacao) {
+        envia_ln(jogo->jogadores[alvo].sock, msg_para_alvo);
+        envia_ln(jogo->jogadores[jogador].sock, msg_para_palpiteiro);
     }
 
     if (encerrar_com_vitoria) {

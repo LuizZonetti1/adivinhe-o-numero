@@ -50,7 +50,7 @@ goto :eof
 
 :ensure_gcc
 REM 1) Tenta gcc no PATH atual
-g	cc --version >nul 2>&1
+gcc --version >nul 2>&1
 if not errorlevel 1 (
 	exit /b 0
 )

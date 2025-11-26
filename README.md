@@ -38,7 +38,7 @@ adivinhacao_cliente.exe   # P2
 - Ambos os jogadores definem um número secreto no início (intervalo padrão 1–100). Os valores são armazenados somente no servidor.
 - Após os dois confirmarem seus números, o servidor libera os palpites: cada jogador pode tentar descobrir o número do oponente a qualquer momento, sem depender de "vez".
 - Cada tentativa recebe um feedback imediato: `MAIOR`, `MENOR` ou `ACERTOU`. O oponente também é notificado do palpite recebido.
-- A cada 3 palpites errados de um jogador, o servidor aplica automaticamente uma operação matemática (somar, multiplicar, dividir ou subtrair) sobre o número secreto **do oponente**. O dono do número recebe o novo valor, enquanto quem errou é avisado apenas de que o alvo mudou.
+- A cada 3 palpites errados de um jogador, o servidor aplica automaticamente uma operação matemática (somar, multiplicar, dividir ou subtrair) sobre o número secreto **do oponente** — somente operações cujo resultado permaneça no intervalo válido (1–100) são consideradas. O dono do número recebe o novo valor, enquanto quem errou é avisado apenas de que o alvo mudou.
 - Vence quem descobrir primeiro o número do adversário. Após o encerramento, a sessão é finalizada (para uma nova partida basta executar novamente servidor e clientes).
 - Durante o jogo, o cliente pode digitar `sair` para abandonar a partida; o oponente será notificado.
 
