@@ -1,6 +1,6 @@
 # Jogo de Adivinhação (2 Jogadores, Cliente/Servidor)
 
-Este projeto implementa um jogo de adivinhação competitivo para dois jogadores via TCP (Winsock) no Windows.
+Este projeto implementa um jogo de adivinhação competitivo para dois jogadores via TCP (Winsock) no Windows. O servidor mantém os números secretos em memória compartilhada entre duas threads — uma por jogador — permitindo tentativas simultâneas e regras dinâmicas.
 
 ## Arquivos
 - `adivinhacao_servidor.c` — servidor TCP que coordena 2 clientes; cada jogador escolhe seu número secreto (1–100).
@@ -35,23 +35,27 @@ adivinhacao_cliente.exe   # P2
 ```
 
 ## Regras (2 jogadores)
-- Ambos os jogadores definem um número secreto (1–100) no início da partida.
-- As jogadas são alternadas: P1 tenta adivinhar o número de P2, depois P2 tenta adivinhar o número de P1.
-- O servidor informa MAIOR/MENOR/ACERTOU para quem chutou e notifica o oponente sobre o palpite recebido.
-- Vence quem acertar primeiro o número do oponente.
-- Após o fim, o servidor pergunta aos dois se desejam jogar novamente; a partida só reinicia se ambos responderem `1`.
+- Ambos os jogadores definem um número secreto no início (intervalo padrão 1–100). Os valores são armazenados somente no servidor.
+- Após os dois confirmarem seus números, o servidor libera os palpites: cada jogador pode tentar descobrir o número do oponente a qualquer momento, sem depender de "vez".
+- Cada tentativa recebe um feedback imediato: `MAIOR`, `MENOR` ou `ACERTOU`. O oponente também é notificado do palpite recebido.
+- A cada 3 palpites errados de um jogador, o servidor aplica automaticamente uma operação matemática (somar, multiplicar, dividir ou subtrair) sobre o número secreto **do oponente**. O dono do número recebe o novo valor, enquanto quem errou é avisado apenas de que o alvo mudou.
+- Vence quem descobrir primeiro o número do adversário. Após o encerramento, a sessão é finalizada (para uma nova partida basta executar novamente servidor e clientes).
+- Durante o jogo, o cliente pode digitar `sair` para abandonar a partida; o oponente será notificado.
 
 ## Protocolo (mensagens principais)
 - `BEM_VINDO P{1|2}` — identificação do jogador.
-- `DEFINA_SECRETO 1 100` — o cliente deve responder com um inteiro (1–100).
-- `SUA_VEZ` — o cliente deve enviar seu palpite (inteiro, 1–100).
-- `VEZ_DO_OPONENTE` — aguarde a jogada do outro.
-- `RESULTADO MAIOR|MENOR|ACERTOU|ENTRADA_INVALIDA` — retorno da sua jogada.
-- `OPONENTE_CHUTOU <n> <MAIOR|MENOR|ACERTOU>` — notificação informativa.
-- `OPONENTE_ACERTOU` — o oponente acertou seu número.
-- `JOGAR_NOVAMENTE? 1-Sim 2-Nao` — ambos respondem com `1` ou `2`.
+- `DEFINA_SECRETO <min> <max>` — o cliente deve enviar um inteiro dentro do intervalo informado.
+- `SECRETO_REGISTRADO` / `AGUARDE_OPONENTE_DEFINIR` — confirmações do servidor.
+- `LIBERADO_PALPITES` + `VOCES_PODEM_ADIVINHAR_A_QUALQUER_MOMENTO` — habilita tentativas paralelas; o cliente passa a enviar comandos `PALPITE <valor>` quando desejar.
+- `PALPITE_RESULTADO <MAIOR|MENOR|ACERTOU|AGUARDE|PARTIDA_ENCERRADA|ENTRADA_INVALIDA>` — retorno imediato da tentativa local.
+- `OPONENTE_TENTOU <valor> <tag>` — informa o palpite recebido do adversário.
+- `NUMERO_ATUALIZADO <novo_valor> <OPERACAO>` — enviado ao jogador cujo número foi modificado após 3 erros consecutivos.
+- `NUMERO_DO_OPONENTE_MUDOU <OPERACAO>` — alerta o outro jogador sobre a mudança (sem revelar o valor).
+- `FIM_PARTIDA VENCEU|PERDEU` e `ENCERRAR` — encerramento normal da sessão.
+- `OPONENTE_DESCONECTOU` — o outro cliente abandonou a partida.
 
 ## Observações
-- O servidor aceita uma conexão por vez (fila 1).
-- Ambos usam buffers de 128 bytes e chamadas `send/recv` de tamanho fixo.
-- Se desejar mudar a porta ou o IP do servidor, altere as `#define` nos arquivos `.c`.
+- O servidor mantém duas threads (Winsock + `_beginthreadex`), compartilhando o estado da partida com `CRITICAL_SECTION`.
+- Os clientes executam um thread dedicado para entrada do usuário; enquanto o modo "palpites" estiver ativo, basta digitar novos números (ou `sair`).
+- O intervalo padrão permanece 1–100, mas pode ser alterado nas `#define` de servidor/cliente.
+- Cada compilação continua dependendo apenas de Winsock (`-lws2_32`).

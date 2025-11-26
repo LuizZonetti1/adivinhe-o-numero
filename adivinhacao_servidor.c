@@ -1,13 +1,44 @@
-// Servidor do jogo de adivinhação de número (2 jogadores)
+// Servidor do jogo de adivinhação (modo simultâneo com memória compartilhada)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdarg.h>
 #include <winsock2.h>
+#include <windows.h>
+#include <process.h>
 
 #pragma comment(lib, "ws2_32.lib")
 
-#define PORTA 12345
+#define PORTA               12345
+#define MIN_SECRETO         1
+#define MAX_SECRETO         100
+#define ERROS_PARA_MUTACAO  3
+
+typedef struct {
+    SOCKET sock;
+    int id;
+    int secret;
+    int secret_definido;
+    int erros_consecutivos;
+    int conectado;
+} PlayerState;
+
+typedef struct {
+    PlayerState jogadores[2];
+    int secretos_prontos;
+    int partida_ativa;
+    int encerrado;
+    int vencedor;
+    CRITICAL_SECTION lock;
+} GameState;
+
+typedef struct {
+    GameState* jogo;
+    int jogador_id;
+} ThreadArgs;
+
+static GameState g_jogo;
 
 static int send_all(SOCKET s, const char* buf, int len) {
     const char* p = buf;
@@ -20,8 +51,8 @@ static int send_all(SOCKET s, const char* buf, int len) {
     return 0;
 }
 
-// Envia uma linha terminada por '\n'
 static int envia_ln(SOCKET s, const char* msg) {
+    if (s == INVALID_SOCKET) return SOCKET_ERROR;
     int len = (int)strlen(msg);
     if (len > 0) {
         if (send_all(s, msg, len) == SOCKET_ERROR) return SOCKET_ERROR;
@@ -31,23 +62,30 @@ static int envia_ln(SOCKET s, const char* msg) {
     return 0;
 }
 
-// Recebe até '\n' (ignora '\r'). Retorna número de bytes (sem '\n') ou <=0 em erro/fechamento.
+static int envia_fmt(SOCKET s, const char* fmt, ...) {
+    if (s == INVALID_SOCKET) return SOCKET_ERROR;
+    char buffer[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, ap);
+    va_end(ap);
+    return envia_ln(s, buffer);
+}
+
 static int recebe_ln(SOCKET s, char* out, int outsz) {
     if (outsz <= 1) return -1;
     int pos = 0;
     for (;;) {
         char c;
         int r = recv(s, &c, 1, 0);
-        if (r == 0) { // conexão fechada
+        if (r == 0) {
             if (pos == 0) return 0;
             break;
         }
         if (r == SOCKET_ERROR) {
             return -1;
         }
-        if (c == '\n') {
-            break;
-        }
+        if (c == '\n') break;
         if (c == '\r') continue;
         if (pos < outsz - 1) out[pos++] = c;
     }
@@ -55,16 +93,241 @@ static int recebe_ln(SOCKET s, char* out, int outsz) {
     return pos;
 }
 
+static void safe_shutdown(SOCKET s) {
+    if (s != INVALID_SOCKET) shutdown(s, SD_BOTH);
+}
+
+static int clamp_int(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static int registrar_secreto(GameState* jogo, int jogador, int valor) {
+    int iniciar = 0;
+    EnterCriticalSection(&jogo->lock);
+    if (!jogo->jogadores[jogador].secret_definido && !jogo->encerrado) {
+        jogo->jogadores[jogador].secret = valor;
+        jogo->jogadores[jogador].secret_definido = 1;
+        jogo->secretos_prontos++;
+        if (jogo->secretos_prontos == 2) {
+            jogo->partida_ativa = 1;
+            iniciar = 1;
+        }
+    }
+    LeaveCriticalSection(&jogo->lock);
+    return iniciar;
+}
+
+static void avisar_inicio(GameState* jogo) {
+    for (int i = 0; i < 2; i++) {
+        envia_ln(jogo->jogadores[i].sock, "LIBERADO_PALPITES 1 100");
+        envia_ln(jogo->jogadores[i].sock, "VOCES_PODEM_ADIVINHAR_A_QUALQUER_MOMENTO");
+    }
+}
+
+static void aplicar_mutacao(GameState* jogo, int jogador, char* dono_msg, size_t dono_sz, char* opo_msg, size_t opo_sz) {
+    static const char* descricoes[] = {
+        "MULTIPLICADO_POR_2",
+        "SOMADO_7",
+        "DIVIDIDO_POR_2",
+        "SUBTRAIDO_5"
+    };
+    int operacao = rand() % 4;
+    int valor = jogo->jogadores[jogador].secret;
+    switch (operacao) {
+        case 0: valor *= 2; break;
+        case 1: valor += 7; break;
+        case 2: valor = valor / 2; break;
+        case 3: valor -= 5; break;
+    }
+    valor = clamp_int(valor, MIN_SECRETO, MAX_SECRETO);
+    jogo->jogadores[jogador].secret = valor;
+    snprintf(dono_msg, dono_sz, "NUMERO_ATUALIZADO %d %s", valor, descricoes[operacao]);
+    snprintf(opo_msg, opo_sz, "NUMERO_DO_OPONENTE_MUDOU %s", descricoes[operacao]);
+}
+
+static int finalizar_partida(GameState* jogo, int vencedor) {
+    int deve_finalizar = 0;
+    EnterCriticalSection(&jogo->lock);
+    if (!jogo->encerrado) {
+        jogo->encerrado = 1;
+        jogo->partida_ativa = 0;
+        jogo->vencedor = vencedor;
+        deve_finalizar = 1;
+    }
+    LeaveCriticalSection(&jogo->lock);
+    if (!deve_finalizar) return 0;
+
+    int perdedor = 1 - vencedor;
+    SOCKET sv = jogo->jogadores[vencedor].sock;
+    SOCKET sp = jogo->jogadores[perdedor].sock;
+
+    envia_ln(sv, "FIM_PARTIDA VENCEU");
+    envia_ln(sp, "FIM_PARTIDA PERDEU");
+    envia_ln(sv, "ENCERRAR");
+    envia_ln(sp, "ENCERRAR");
+
+    safe_shutdown(sv);
+    safe_shutdown(sp);
+    return 1;
+}
+
+static void tratar_desconexao(GameState* jogo, int jogador) {
+    int outro = 1 - jogador;
+    SOCKET soponente = jogo->jogadores[outro].sock;
+
+    EnterCriticalSection(&jogo->lock);
+    if (!jogo->encerrado) {
+        jogo->encerrado = 1;
+        jogo->partida_ativa = 0;
+    }
+    LeaveCriticalSection(&jogo->lock);
+
+    envia_ln(soponente, "OPONENTE_DESCONECTOU");
+    envia_ln(soponente, "ENCERRAR");
+    safe_shutdown(soponente);
+}
+
+static void tratar_palpite(GameState* jogo, int jogador, int palpite) {
+    int alvo = 1 - jogador;
+    char resultado[16] = {0};
+    char mut_dono[128] = {0};
+    char mut_opo[128] = {0};
+    int aplicar_mut = 0;
+    int secreto_do_oponente = 0;
+    int partida_ativa = 0;
+    int oponente_pronto = 0;
+    int encerrar_com_vitoria = 0;
+
+    EnterCriticalSection(&jogo->lock);
+    partida_ativa = jogo->partida_ativa;
+    oponente_pronto = jogo->jogadores[alvo].secret_definido;
+
+    if (!partida_ativa || !oponente_pronto) {
+        strcpy(resultado, partida_ativa ? "AGUARDE" : "PARTIDA_ENCERRADA");
+        LeaveCriticalSection(&jogo->lock);
+        envia_fmt(jogo->jogadores[jogador].sock, "PALPITE_RESULTADO %s", resultado);
+        return;
+    }
+
+    secreto_do_oponente = jogo->jogadores[alvo].secret;
+    if (palpite < secreto_do_oponente) {
+        strcpy(resultado, "MAIOR");
+    } else if (palpite > secreto_do_oponente) {
+        strcpy(resultado, "MENOR");
+    } else {
+        strcpy(resultado, "ACERTOU");
+        jogo->jogadores[jogador].erros_consecutivos = 0;
+        encerrar_com_vitoria = 1;
+    }
+
+    if (!encerrar_com_vitoria) {
+        jogo->jogadores[jogador].erros_consecutivos++;
+        if (jogo->jogadores[jogador].erros_consecutivos % ERROS_PARA_MUTACAO == 0) {
+            aplicar_mut = 1;
+            aplicar_mutacao(jogo, alvo, mut_dono, sizeof(mut_dono), mut_opo, sizeof(mut_opo));
+        }
+    }
+    LeaveCriticalSection(&jogo->lock);
+
+    envia_fmt(jogo->jogadores[jogador].sock, "PALPITE_RESULTADO %s", resultado);
+    envia_fmt(jogo->jogadores[alvo].sock, "OPONENTE_TENTOU %d %s", palpite, resultado);
+
+    if (aplicar_mut) {
+        envia_ln(jogo->jogadores[alvo].sock, mut_dono);
+        envia_ln(jogo->jogadores[jogador].sock, mut_opo);
+    }
+
+    if (encerrar_com_vitoria) {
+        finalizar_partida(jogo, jogador);
+    }
+}
+
+static unsigned __stdcall rotina_jogador(void* param) {
+    ThreadArgs* args = (ThreadArgs*)param;
+    GameState* jogo = args->jogo;
+    int jogador = args->jogador_id;
+    SOCKET sock = jogo->jogadores[jogador].sock;
+    char linha[256];
+
+    envia_fmt(sock, "BEM_VINDO P%d", jogador + 1);
+    envia_ln(sock, "DEFINA_SECRETO 1 100");
+
+    while (1) {
+        int r = recebe_ln(sock, linha, sizeof(linha));
+        if (r <= 0) {
+            int ja_finalizado = 0;
+            EnterCriticalSection(&jogo->lock);
+            ja_finalizado = jogo->encerrado;
+            LeaveCriticalSection(&jogo->lock);
+            if (!ja_finalizado) {
+                printf("Jogador %d desconectou inesperadamente.\n", jogador + 1);
+                tratar_desconexao(jogo, jogador);
+            }
+            break;
+        }
+
+        if (!jogo->jogadores[jogador].secret_definido) {
+            int valor = 0;
+            if (sscanf(linha, "%d", &valor) == 1 && valor >= MIN_SECRETO && valor <= MAX_SECRETO) {
+                int iniciar = registrar_secreto(jogo, jogador, valor);
+                envia_ln(sock, "SECRETO_REGISTRADO");
+                if (!iniciar) {
+                    envia_ln(sock, "AGUARDE_OPONENTE_DEFINIR");
+                } else {
+                    avisar_inicio(jogo);
+                }
+            } else {
+                envia_ln(sock, "ENTRADA_INVALIDA");
+            }
+            continue;
+        }
+
+        if (strncmp(linha, "PALPITE", 7) == 0) {
+            int palpite = 0;
+            if (sscanf(linha + 7, "%d", &palpite) == 1) {
+                tratar_palpite(jogo, jogador, palpite);
+            } else {
+                envia_ln(sock, "PALPITE_RESULTADO ENTRADA_INVALIDA");
+            }
+            continue;
+        }
+
+        int valor_livre = 0;
+        if (sscanf(linha, "%d", &valor_livre) == 1) {
+            tratar_palpite(jogo, jogador, valor_livre);
+            continue;
+        }
+
+        if (_stricmp(linha, "SAIR") == 0) {
+            tratar_desconexao(jogo, jogador);
+            break;
+        }
+
+        envia_ln(sock, "PALPITE_RESULTADO COMANDO_DESCONHECIDO");
+    }
+
+    closesocket(sock);
+    return 0;
+}
+
 int main(void) {
     WSADATA wsa;
-    SOCKET servidor = INVALID_SOCKET, clientes[2] = {INVALID_SOCKET, INVALID_SOCKET};
+    SOCKET servidor = INVALID_SOCKET;
     struct sockaddr_in addr_servidor, addr_cliente;
     int tam_cliente = sizeof(addr_cliente);
-    char buffer[256];
+    HANDLE threads[2] = {0};
+    ThreadArgs args[2];
 
-    printf("Iniciando servidor de adivinhacao (2 jogadores)...\n");
+    srand((unsigned)time(NULL));
+    memset(&g_jogo, 0, sizeof(g_jogo));
+    InitializeCriticalSection(&g_jogo.lock);
+
+    printf("Servidor de adivinhacao simultaneo - aguardando jogadores...\n");
     if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
         printf("Falha no WSAStartup.\n");
+        DeleteCriticalSection(&g_jogo.lock);
         return 1;
     }
 
@@ -72,10 +335,10 @@ int main(void) {
     if (servidor == INVALID_SOCKET) {
         printf("Falha ao criar socket.\n");
         WSACleanup();
+        DeleteCriticalSection(&g_jogo.lock);
         return 1;
     }
 
-    // Reuso rápido de porta (evita TIME_WAIT atrapalhar)
     BOOL opt = 1;
     setsockopt(servidor, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
 
@@ -88,6 +351,7 @@ int main(void) {
         printf("Erro no bind. Porta %d pode estar em uso.\n", PORTA);
         closesocket(servidor);
         WSACleanup();
+        DeleteCriticalSection(&g_jogo.lock);
         return 1;
     }
 
@@ -95,119 +359,41 @@ int main(void) {
         printf("Erro no listen.\n");
         closesocket(servidor);
         WSACleanup();
+        DeleteCriticalSection(&g_jogo.lock);
         return 1;
     }
 
-    printf("Aguardando 2 conexoes na porta %d...\n", PORTA);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 2; ++i) {
         tam_cliente = sizeof(addr_cliente);
-        clientes[i] = accept(servidor, (struct sockaddr*)&addr_cliente, &tam_cliente);
-        if (clientes[i] == INVALID_SOCKET) {
-            printf("Erro no accept para jogador %d.\n", i+1);
-            for (int j = 0; j < 2; j++) if (clientes[j] != INVALID_SOCKET) closesocket(clientes[j]);
+        g_jogo.jogadores[i].sock = accept(servidor, (struct sockaddr*)&addr_cliente, &tam_cliente);
+        if (g_jogo.jogadores[i].sock == INVALID_SOCKET) {
+            printf("Erro ao aceitar jogador %d.\n", i + 1);
+            for (int j = 0; j < i; ++j) closesocket(g_jogo.jogadores[j].sock);
             closesocket(servidor);
             WSACleanup();
+            DeleteCriticalSection(&g_jogo.lock);
             return 1;
         }
-        snprintf(buffer, sizeof(buffer), "BEM_VINDO P%d", i+1);
-        envia_ln(clientes[i], buffer);
+        g_jogo.jogadores[i].id = i;
+        g_jogo.jogadores[i].conectado = 1;
+        printf("Jogador %d conectado.\n", i + 1);
     }
 
-    int continuar = 1;
-    while (continuar) {
-        // Cada jogador define seu numero secreto
-        int secreto[2] = {0, 0};
-        for (int i = 0; i < 2; i++) {
-            // Informa o outro jogador que deve aguardar
-            int outro = 1 - i;
-            if (i == 0) {
-                // P2 aguarda P1 escolher
-                envia_ln(clientes[outro], "AGUARDE_ADVERSARIO_ESCOLHER");
-            } else {
-                // P1 aguarda P2 escolher  
-                envia_ln(clientes[outro], "AGUARDE_ADVERSARIO_ESCOLHER");
-            }
-            
-            for (;;) {
-                envia_ln(clientes[i], "DEFINA_SECRETO 1 100");
-                int r = recebe_ln(clientes[i], buffer, sizeof(buffer));
-                if (r <= 0) { continuar = 0; break; }
-                int num = 0;
-                if (sscanf(buffer, "%d", &num) == 1 && num >= 1 && num <= 100) {
-                    secreto[i] = num;
-                    break;
-                } else {
-                    envia_ln(clientes[i], "ENTRADA_INVALIDA");
-                }
-            }
-            if (!continuar) break;
-        }
-        if (!continuar) break;
-
-        // Laço de turnos
-        int vez = 0; // 0 = P1 joga, 1 = P2 joga
-        for (;;) {
-            int atual = vez;
-            int outro = 1 - vez;
-
-            envia_ln(clientes[atual], "SUA_VEZ");
-            envia_ln(clientes[outro], "VEZ_DO_OPONENTE");
-
-            // Recebe palpite do jogador da vez
-            int r = recebe_ln(clientes[atual], buffer, sizeof(buffer));
-            if (r <= 0) { continuar = 0; break; }
-            int palpite = 0;
-            if (sscanf(buffer, "%d", &palpite) != 1) {
-                envia_ln(clientes[atual], "RESULTADO ENTRADA_INVALIDA");
-                continue; // repete mesma vez
-            }
-
-            const char* tag = NULL;
-            if (palpite < secreto[outro]) tag = "MAIOR";
-            else if (palpite > secreto[outro]) tag = "MENOR";
-            else tag = "ACERTOU";
-
-            // Envia resultado para quem jogou
-            snprintf(buffer, sizeof(buffer), "RESULTADO %s", tag);
-            envia_ln(clientes[atual], buffer);
-
-            // Informa oponente do palpite e do resultado
-            snprintf(buffer, sizeof(buffer), "OPONENTE_CHUTOU %d %s", palpite, tag);
-            envia_ln(clientes[outro], buffer);
-
-            if (strcmp(tag, "ACERTOU") == 0) {
-                envia_ln(clientes[outro], "OPONENTE_ACERTOU");
-                // Final da partida: informa quem venceu/perdeu
-                envia_ln(clientes[atual], "FIM_PARTIDA VENCEU");
-                envia_ln(clientes[outro], "FIM_PARTIDA PERDEU");
-                break;
-            } else {
-                vez = outro; // alterna a vez
-            }
-        }
-        if (!continuar) break;
-
-        // Pergunta se querem jogar novamente (ambos)
-        envia_ln(clientes[0], "JOGAR_NOVAMENTE? 1-Sim 2-Nao");
-        envia_ln(clientes[1], "JOGAR_NOVAMENTE? 1-Sim 2-Nao");
-
-        char respbuf1[32] = {0};
-        char respbuf2[32] = {0};
-        int r1 = recebe_ln(clientes[0], respbuf1, sizeof(respbuf1));
-        int r2 = recebe_ln(clientes[1], respbuf2, sizeof(respbuf2));
-        int resp1 = (r1 > 0 && respbuf1[0] == '1') ? 1 : 0;
-        int resp2 = (r2 > 0 && respbuf2[0] == '1') ? 1 : 0;
-
-        if (!(resp1 && resp2)) {
-            // Notifica ambos para encerrar
-            envia_ln(clientes[0], "ENCERRAR");
-            envia_ln(clientes[1], "ENCERRAR");
-            continuar = 0;
-        }
+    for (int i = 0; i < 2; ++i) {
+        args[i].jogo = &g_jogo;
+        args[i].jogador_id = i;
+        threads[i] = (HANDLE)_beginthreadex(NULL, 0, rotina_jogador, &args[i], 0, NULL);
     }
 
-    for (int i = 0; i < 2; i++) if (clientes[i] != INVALID_SOCKET) closesocket(clientes[i]);
+    WaitForMultipleObjects(2, threads, TRUE, INFINITE);
+
+    for (int i = 0; i < 2; ++i) {
+        if (threads[i]) CloseHandle(threads[i]);
+    }
+
     closesocket(servidor);
     WSACleanup();
+    DeleteCriticalSection(&g_jogo.lock);
+    printf("Servidor finalizado.\n");
     return 0;
 }
